@@ -233,7 +233,7 @@ def proxy_kwargs_for_aiohttp(proxy_url: str | None) -> tuple[dict, dict]:
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple
+from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -629,6 +629,38 @@ def cleanup_document_cache(max_age_hours: int = 24) -> int:
             except OSError:
                 pass
     return removed
+
+
+# Content Block Data Structures for Media Delivery
+@dataclass
+class MediaGroupItem:
+    """A single item in a media group (album)."""
+    path_or_url: str
+    caption: Optional[str] = None
+    send_as_document: bool = False
+
+
+@dataclass
+class TextBlock:
+    """Plain text content block."""
+    text: str
+
+
+@dataclass
+class ImageBlock:
+    """Single image content block with optional caption."""
+    path_or_url: str
+    caption: Optional[str] = None
+    send_as_document: bool = False
+
+
+@dataclass
+class MediaGroupBlock:
+    """Media group (album) content block with multiple items."""
+    items: List[MediaGroupItem]
+
+
+ContentBlock = Union[TextBlock, ImageBlock, MediaGroupBlock]
 
 
 class MessageType(Enum):
@@ -1188,6 +1220,78 @@ class BasePlatformAdapter(ABC):
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
 
+    async def send_media_group(
+        self,
+        chat_id: str,
+        media_items: List[MediaGroupItem],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """
+        Send a media group (album) of images/videos.
+
+        Args:
+            chat_id: Platform-specific chat identifier
+            media_items: List of media items to send as a group
+            metadata: Optional platform-specific metadata
+
+        Returns:
+            SendResult indicating success/failure
+
+        Default implementation sends items individually (not as a group).
+        Override in subclasses for native media group support.
+        """
+        # Default fallback: send each item individually
+        for item in media_items:
+            try:
+                if item.path_or_url.startswith('http'):
+                    await self.send_image(
+                        chat_id=chat_id,
+                        image_url=item.path_or_url,
+                        caption=item.caption,
+                        metadata=metadata,
+                    )
+                else:
+                    if item.send_as_document:
+                        await self.send_document(
+                            chat_id=chat_id,
+                            file_path=item.path_or_url,
+                            caption=item.caption,
+                            metadata=metadata,
+                        )
+                    else:
+                        await self.send_image_file(
+                            chat_id=chat_id,
+                            image_path=item.path_or_url,
+                            caption=item.caption,
+                            metadata=metadata,
+                        )
+            except Exception as e:
+                logger.warning("Failed to send media group item %s: %s", item.path_or_url, e)
+
+        return SendResult(success=True)
+
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """
+        Delete a previously sent message.
+
+        Args:
+            chat_id: Platform-specific chat identifier
+            message_id: Platform-specific message identifier
+            metadata: Optional platform-specific metadata
+
+        Returns:
+            SendResult indicating success/failure
+
+        Default implementation returns failure (not supported).
+        Override in subclasses for platforms that support message deletion.
+        """
+        return SendResult(success=False, error="Message deletion not supported")
+
     @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
         """
@@ -1568,7 +1672,176 @@ class BasePlatformAdapter(ABC):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
             task.add_done_callback(self._expected_cancelled_tasks.discard)
-    
+
+    @staticmethod
+    def _parse_content_blocks(response: str) -> List[ContentBlock]:
+        """
+        Parse agent response into ordered content blocks.
+
+        This method parses the response text into a sequence of content blocks:
+        - TextBlock: plain text to send as messages
+        - ImageBlock: single image with optional caption
+        - MediaGroupBlock: album of images, auto-split if >10 items
+
+        Logic:
+        - Text before any media reference → TextBlock
+        - Media reference followed by text → ImageBlock with caption
+        - Consecutive media references → MediaGroupBlock
+        - Media groups >10 items → auto-split into chunks of 10
+
+        Args:
+            response: The raw agent response text
+
+        Returns:
+            Ordered list of content blocks to process sequentially
+        """
+        from pathlib import Path
+        import re
+
+        if not response.strip():
+            return []
+
+        # File extension constants
+        _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+        _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+        _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
+
+        blocks = []
+        lines = response.split('\n')
+        current_text = []
+        pending_media = []
+
+        def _is_media_reference(line: str) -> Tuple[Optional[str], bool]:
+            """Check if line is a media reference. Returns (path_or_url, send_as_document)."""
+            line = line.strip()
+
+            # Check for MEDIA: tags (from TTS tool and explicit tags)
+            media_match = re.match(r'^\s*(?:FILE:)?MEDIA:\s*(.+)', line)
+            if media_match:
+                path = media_match.group(1).strip()
+                send_as_document = line.strip().startswith('FILE:')
+                return path, send_as_document
+
+            # Check for bare local file paths
+            if line.startswith('/') or line.startswith('~/'):
+                try:
+                    path_obj = Path(line).expanduser()
+                    ext = path_obj.suffix.lower()
+                    if ext in (_IMAGE_EXTS | _VIDEO_EXTS | _AUDIO_EXTS):
+                        # Only include if file exists to avoid false positives
+                        if path_obj.exists():
+                            return line, False
+                except Exception:
+                    pass
+
+            # Check for markdown images ![alt](url)
+            img_match = re.match(r'^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$', line)
+            if img_match:
+                alt_text = img_match.group(1)
+                url = img_match.group(2)
+                return url, False
+
+            return None, False
+
+        def _flush_current_text():
+            """Flush accumulated text as TextBlock."""
+            nonlocal current_text
+            if current_text:
+                text = '\n'.join(current_text).strip()
+                if text:
+                    blocks.append(TextBlock(text=text))
+                current_text = []
+
+        def _flush_pending_media():
+            """Flush accumulated media as ImageBlock or MediaGroupBlock."""
+            nonlocal pending_media
+            if not pending_media:
+                return
+
+            # Attach any trailing caption text to a pending media item.
+            # Back-compat: if NO item already has a per-item caption, this is
+            # the legacy group-level caption shape — attach to the FIRST item
+            # (which is also how Telegram historically surfaced the shared
+            # album caption).  Otherwise the trailing text belongs to the
+            # LAST item as its per-item caption.
+            if current_text:
+                trailing = '\n'.join(current_text).strip()
+                if trailing:
+                    any_item_has_caption = any(cap for _, _, cap in pending_media)
+                    target_idx = -1 if any_item_has_caption else 0
+                    path, doc, existing_cap = pending_media[target_idx]
+                    if not existing_cap:
+                        pending_media[target_idx] = (path, doc, trailing)
+                current_text[:] = []
+
+            if len(pending_media) == 1:
+                # Single image - create ImageBlock
+                path, send_as_document, cap = pending_media[0]
+                blocks.append(ImageBlock(
+                    path_or_url=path,
+                    caption=cap,
+                    send_as_document=send_as_document
+                ))
+            else:
+                # Multiple images - create MediaGroupBlock(s).
+                # Telegram limit is 10 items per group, so split if needed.
+                # Each item keeps its own caption (per-item captions).
+                for i in range(0, len(pending_media), 10):
+                    chunk = pending_media[i:i+10]
+                    items = []
+                    for path, send_as_document, cap in chunk:
+                        items.append(MediaGroupItem(
+                            path_or_url=path,
+                            caption=cap,
+                            send_as_document=send_as_document
+                        ))
+                    blocks.append(MediaGroupBlock(items=items))
+
+            pending_media = []
+
+        for line in lines:
+            media_path, send_as_document = _is_media_reference(line)
+
+            if media_path:
+                # This line is a media reference.
+                # Any accumulated text attaches to the MOST RECENT pending
+                # media item as that item's caption — enabling per-item
+                # captions within a single album.
+                if pending_media and current_text:
+                    cap = '\n'.join(current_text).strip()
+                    if cap:
+                        path, doc, _ = pending_media[-1]
+                        pending_media[-1] = (path, doc, cap)
+                    current_text[:] = []
+                elif not pending_media and current_text:
+                    # Text before first media — flush as TextBlock
+                    _flush_current_text()
+
+                pending_media.append((media_path, send_as_document, None))
+            else:
+                # This line is text
+                if pending_media:
+                    has_caption_text = any(l.strip() for l in current_text)
+
+                    if not line.strip():
+                        if has_caption_text:
+                            # Empty line after caption text → end of group
+                            _flush_pending_media()
+                        # else: skip empty lines between MEDIA tags
+                    else:
+                        current_text.append(line)
+                else:
+                    # No pending media, accumulate as regular text
+                    current_text.append(line)
+
+        # Flush any remaining content
+        if pending_media:
+            _flush_pending_media()
+        else:
+            _flush_current_text()
+
+        return blocks
+
     @staticmethod
     def _get_human_delay() -> float:
         """

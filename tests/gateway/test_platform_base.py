@@ -6,8 +6,12 @@ from unittest.mock import patch
 from gateway.platforms.base import (
     BasePlatformAdapter,
     GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE,
+    ImageBlock,
+    MediaGroupBlock,
+    MediaGroupItem,
     MessageEvent,
     MessageType,
+    TextBlock,
     safe_url_for_log,
     utf16_len,
     _prefix_within_utf16_limit,
@@ -581,4 +585,187 @@ class TestTruncateMessageUtf16:
             assert fence_count % 2 == 0, (
                 f"Chunk {i} has unbalanced fences ({fence_count})"
             )
+
+
+# ---------------------------------------------------------------------------
+# _parse_content_blocks
+# ---------------------------------------------------------------------------
+
+
+class TestParseContentBlocks:
+    """Tests for the content block parser used by streaming media delivery."""
+
+    def test_text_only(self):
+        blocks = BasePlatformAdapter._parse_content_blocks("Hello world")
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], TextBlock)
+        assert blocks[0].text == "Hello world"
+
+    def test_single_media_with_caption(self, tmp_path):
+        img = tmp_path / "photo.png"
+        img.write_bytes(b"\x89PNG")
+        response = f"MEDIA:{img}\nCaption text"
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], ImageBlock)
+        assert blocks[0].caption == "Caption text"
+
+    def test_media_group_consecutive(self, tmp_path):
+        paths = []
+        for i in range(3):
+            p = tmp_path / f"img{i}.png"
+            p.write_bytes(b"\x89PNG")
+            paths.append(p)
+        response = "\n".join(f"MEDIA:{p}" for p in paths)
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], MediaGroupBlock)
+        assert len(blocks[0].items) == 3
+
+    def test_media_group_with_trailing_caption_legacy(self, tmp_path):
+        """Legacy shape: trailing caption with no per-item captions attaches to the FIRST item.
+
+        This preserves backward compatibility with agents that emit one
+        group-level caption after a run of MEDIA tags — the caption visually
+        surfaces on Telegram as the album's shared caption.
+        """
+        paths = []
+        for i in range(3):
+            p = tmp_path / f"img{i}.png"
+            p.write_bytes(b"\x89PNG")
+            paths.append(p)
+        response = "\n".join(f"MEDIA:{p}" for p in paths) + "\nShared caption"
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], MediaGroupBlock)
+        # Legacy behaviour: trailing caption attaches to FIRST item
+        assert blocks[0].items[0].caption == "Shared caption"
+        assert all(item.caption is None for item in blocks[0].items[1:])
+
+    def test_media_group_trailing_caption_after_per_item(self, tmp_path):
+        """Mixed shape: if earlier items have per-item captions, a trailing
+        caption belongs to the LAST item as its per-item caption."""
+        p1 = tmp_path / "a.png"; p1.write_bytes(b"\x89PNG")
+        p2 = tmp_path / "b.png"; p2.write_bytes(b"\x89PNG")
+        p3 = tmp_path / "c.png"; p3.write_bytes(b"\x89PNG")
+        response = f"MEDIA:{p1}\nCap A\nMEDIA:{p2}\nMEDIA:{p3}\nLast caption"
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], MediaGroupBlock)
+        assert [i.caption for i in blocks[0].items] == ["Cap A", None, "Last caption"]
+
+    def test_per_item_captions_stay_in_one_group(self, tmp_path):
+        """MEDIA + caption + MEDIA + caption forms ONE album with per-item captions."""
+        p1 = tmp_path / "a.png"; p1.write_bytes(b"\x89PNG")
+        p2 = tmp_path / "b.png"; p2.write_bytes(b"\x89PNG")
+        p3 = tmp_path / "c.png"; p3.write_bytes(b"\x89PNG")
+        response = (
+            f"MEDIA:{p1}\nCaption A\n"
+            f"MEDIA:{p2}\nCaption B\n"
+            f"MEDIA:{p3}\nCaption C"
+        )
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], MediaGroupBlock)
+        assert len(blocks[0].items) == 3
+        assert blocks[0].items[0].caption == "Caption A"
+        assert blocks[0].items[1].caption == "Caption B"
+        assert blocks[0].items[2].caption == "Caption C"
+
+    def test_text_then_media_group_then_single(self, tmp_path):
+        """Text intro + album (per-item captions) + blank line + single image w/ caption."""
+        album_paths = []
+        for i in range(8):
+            p = tmp_path / f"album{i}.png"
+            p.write_bytes(b"\x89PNG")
+            album_paths.append(p)
+        single = tmp_path / "single.png"
+        single.write_bytes(b"\x89PNG")
+
+        lines = ["Text intro paragraph", ""]
+        for idx, p in enumerate(album_paths):
+            lines.append(f"MEDIA:{p}")
+            lines.append(f"Album item {idx}")
+        # Blank line separates album from the next single image
+        lines.append("")
+        lines.append(f"MEDIA:{single}")
+        lines.append("Caption for single")
+
+        response = "\n".join(lines)
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+
+        assert len(blocks) == 3, f"Expected 3 blocks, got {len(blocks)}: {blocks}"
+        assert isinstance(blocks[0], TextBlock)
+        assert blocks[0].text == "Text intro paragraph"
+        assert isinstance(blocks[1], MediaGroupBlock)
+        assert len(blocks[1].items) == 8
+        # Each album item has its own caption
+        for idx, item in enumerate(blocks[1].items):
+            assert item.caption == f"Album item {idx}"
+        assert isinstance(blocks[2], ImageBlock)
+        assert blocks[2].caption == "Caption for single"
+
+    def test_blank_line_separates_media_groups(self, tmp_path):
+        """A blank line after caption text ends the current group.
+
+        Two consecutive MEDIA lines with no per-item caption, followed by a
+        trailing caption, are treated as the legacy group-level caption shape
+        (caption attaches to the first item).
+        """
+        p1 = tmp_path / "a.png"; p1.write_bytes(b"\x89PNG")
+        p2 = tmp_path / "b.png"; p2.write_bytes(b"\x89PNG")
+        p3 = tmp_path / "c.png"; p3.write_bytes(b"\x89PNG")
+
+        # Two media sharing a trailing caption, blank line, then standalone image
+        response = f"MEDIA:{p1}\nMEDIA:{p2}\nFirst caption\n\nMEDIA:{p3}\nSecond caption"
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+
+        assert len(blocks) == 2, f"Expected 2 blocks, got {len(blocks)}: {blocks}"
+        # First block: media group of 2. No per-item captions inside, so the
+        # trailing "First caption" attaches to the FIRST item (legacy shape).
+        assert isinstance(blocks[0], MediaGroupBlock)
+        assert len(blocks[0].items) == 2
+        assert blocks[0].items[0].caption == "First caption"
+        assert blocks[0].items[1].caption is None
+        # Second block: single image with its own caption
+        assert isinstance(blocks[1], ImageBlock)
+        assert blocks[1].caption == "Second caption"
+
+    def test_media_group_auto_splits_at_10(self, tmp_path):
+        paths = []
+        for i in range(12):
+            p = tmp_path / f"img{i}.png"
+            p.write_bytes(b"\x89PNG")
+            paths.append(p)
+        response = "\n".join(f"MEDIA:{p}" for p in paths)
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+        # Should be split into a group of 10 and a group of 2
+        assert len(blocks) == 2
+        assert isinstance(blocks[0], MediaGroupBlock)
+        assert len(blocks[0].items) == 10
+        assert isinstance(blocks[1], MediaGroupBlock)
+        assert len(blocks[1].items) == 2
+
+    def test_empty_response(self):
+        blocks = BasePlatformAdapter._parse_content_blocks("")
+        assert blocks == []
+        blocks = BasePlatformAdapter._parse_content_blocks("   \n  ")
+        assert blocks == []
+
+    def test_media_url(self):
+        response = "MEDIA:https://example.com/photo.png\nCaption"
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], ImageBlock)
+        assert blocks[0].path_or_url == "https://example.com/photo.png"
+        assert blocks[0].caption == "Caption"
+
+    def test_file_document_prefix(self, tmp_path):
+        p = tmp_path / "doc.pdf"
+        p.write_bytes(b"%PDF")
+        response = f"FILE:MEDIA:{p}"
+        blocks = BasePlatformAdapter._parse_content_blocks(response)
+        assert len(blocks) == 1
+        assert isinstance(blocks[0], ImageBlock)
+        assert blocks[0].send_as_document is True
 
