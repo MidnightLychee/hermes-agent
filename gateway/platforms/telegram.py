@@ -12,12 +12,12 @@ import json
 import logging
 import os
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
 try:
-    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, InputMediaVideo, InputMediaDocument
     from telegram.ext import (
         Application,
         CommandHandler,
@@ -41,6 +41,9 @@ except ImportError:
     CallbackQueryHandler = Any
     TelegramMessageHandler = Any
     HTTPXRequest = Any
+    InputMediaPhoto = Any
+    InputMediaVideo = Any
+    InputMediaDocument = Any
     filters = None
     ParseMode = None
     ChatType = None
@@ -62,6 +65,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    MediaGroupItem,
     cache_image_from_bytes,
     cache_audio_from_bytes,
     cache_document_from_bytes,
@@ -1532,6 +1536,7 @@ class TelegramAdapter(BasePlatformAdapter):
             if not os.path.exists(audio_path):
                 return SendResult(success=False, error=f"Audio file not found: {audio_path}")
             
+            formatted_caption, parse_mode = self._prepare_caption(caption)
             with open(audio_path, "rb") as audio_file:
                 # .ogg files -> send as voice (round playable bubble)
                 if audio_path.endswith((".ogg", ".opus")):
@@ -1539,7 +1544,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     msg = await self._bot.send_voice(
                         chat_id=int(chat_id),
                         voice=audio_file,
-                        caption=caption[:1024] if caption else None,
+                        caption=formatted_caption,
+                        parse_mode=parse_mode,
                         reply_to_message_id=int(reply_to) if reply_to else None,
                         message_thread_id=int(_voice_thread) if _voice_thread else None,
                     )
@@ -1549,7 +1555,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     msg = await self._bot.send_audio(
                         chat_id=int(chat_id),
                         audio=audio_file,
-                        caption=caption[:1024] if caption else None,
+                        caption=formatted_caption,
+                        parse_mode=parse_mode,
                         reply_to_message_id=int(reply_to) if reply_to else None,
                         message_thread_id=int(_audio_thread) if _audio_thread else None,
                     )
@@ -1582,11 +1589,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=f"Image file not found: {image_path}")
 
             _thread = metadata.get("thread_id") if metadata else None
+            formatted_caption, parse_mode = self._prepare_caption(caption)
             with open(image_path, "rb") as image_file:
                 msg = await self._bot.send_photo(
                     chat_id=int(chat_id),
                     photo=image_file,
-                    caption=caption[:1024] if caption else None,
+                    caption=formatted_caption,
+                    parse_mode=parse_mode,
                     reply_to_message_id=int(reply_to) if reply_to else None,
                     message_thread_id=int(_thread) if _thread else None,
                 )
@@ -1620,13 +1629,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
             display_name = file_name or os.path.basename(file_path)
             _thread = metadata.get("thread_id") if metadata else None
+            formatted_caption, parse_mode = self._prepare_caption(caption)
 
             with open(file_path, "rb") as f:
                 msg = await self._bot.send_document(
                     chat_id=int(chat_id),
                     document=f,
                     filename=display_name,
-                    caption=caption[:1024] if caption else None,
+                    caption=formatted_caption,
+                    parse_mode=parse_mode,
                     reply_to_message_id=int(reply_to) if reply_to else None,
                     message_thread_id=int(_thread) if _thread else None,
                 )
@@ -1653,11 +1664,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 return SendResult(success=False, error=f"Video file not found: {video_path}")
 
             _thread = metadata.get("thread_id") if metadata else None
+            formatted_caption, parse_mode = self._prepare_caption(caption)
             with open(video_path, "rb") as f:
                 msg = await self._bot.send_video(
                     chat_id=int(chat_id),
                     video=f,
-                    caption=caption[:1024] if caption else None,
+                    caption=formatted_caption,
+                    parse_mode=parse_mode,
                     reply_to_message_id=int(reply_to) if reply_to else None,
                     message_thread_id=int(_thread) if _thread else None,
                 )
@@ -1690,10 +1703,12 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             # Telegram can send photos directly from URLs (up to ~5MB)
             _photo_thread = metadata.get("thread_id") if metadata else None
+            formatted_caption, parse_mode = self._prepare_caption(caption)
             msg = await self._bot.send_photo(
                 chat_id=int(chat_id),
                 photo=image_url,
-                caption=caption[:1024] if caption else None,  # Telegram caption limit
+                caption=formatted_caption,
+                parse_mode=parse_mode,
                 reply_to_message_id=int(reply_to) if reply_to else None,
                 message_thread_id=int(_photo_thread) if _photo_thread else None,
             )
@@ -1716,7 +1731,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 msg = await self._bot.send_photo(
                     chat_id=int(chat_id),
                     photo=image_data,
-                    caption=caption[:1024] if caption else None,
+                    caption=formatted_caption,
+                    parse_mode=parse_mode,
                     reply_to_message_id=int(reply_to) if reply_to else None,
                 )
                 return SendResult(success=True, message_id=str(msg.message_id))
@@ -1744,10 +1760,12 @@ class TelegramAdapter(BasePlatformAdapter):
         
         try:
             _anim_thread = metadata.get("thread_id") if metadata else None
+            formatted_caption, parse_mode = self._prepare_caption(caption)
             msg = await self._bot.send_animation(
                 chat_id=int(chat_id),
                 animation=animation_url,
-                caption=caption[:1024] if caption else None,
+                caption=formatted_caption,
+                parse_mode=parse_mode,
                 reply_to_message_id=int(reply_to) if reply_to else None,
                 message_thread_id=int(_anim_thread) if _anim_thread else None,
             )
@@ -1780,7 +1798,202 @@ class TelegramAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-    
+
+    def _prepare_caption(self, caption: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Prepare a caption for Telegram with MarkdownV2 formatting and fallback.
+
+        Returns:
+            (formatted_caption, parse_mode) where parse_mode is None for plain text fallback
+        """
+        if not caption:
+            return None, None
+
+        # Truncate to Telegram's limit
+        truncated = caption[:1024] if len(caption) > 1024 else caption
+
+        try:
+            # Try MarkdownV2 formatting
+            formatted = self.format_message(truncated)
+            return formatted, ParseMode.MARKDOWN_V2
+        except Exception:
+            # Fall back to plain text
+            return truncated, None
+
+    async def send_media_group(
+        self,
+        chat_id: str,
+        media_items: List[MediaGroupItem],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a media group (album) of images/videos via Telegram."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        if not media_items:
+            return SendResult(success=False, error="No media items provided")
+
+        try:
+            from pathlib import Path
+
+            media_list = []
+            _thread = metadata.get("thread_id") if metadata else None
+
+            for item in media_items:
+                try:
+                    # Prepare media item based on type
+                    if item.path_or_url.startswith('http'):
+                        # URL-based media
+                        if item.send_as_document:
+                            formatted_caption, parse_mode = self._prepare_caption(item.caption)
+                            media_obj = InputMediaDocument(
+                                media=item.path_or_url,
+                                caption=formatted_caption,
+                                parse_mode=parse_mode,
+                            )
+                        else:
+                            # Try to detect if it's a video URL
+                            formatted_caption, parse_mode = self._prepare_caption(item.caption)
+                            if any(item.path_or_url.lower().endswith(ext) for ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp']):
+                                media_obj = InputMediaVideo(
+                                    media=item.path_or_url,
+                                    caption=formatted_caption,
+                                    parse_mode=parse_mode,
+                                )
+                            else:
+                                media_obj = InputMediaPhoto(
+                                    media=item.path_or_url,
+                                    caption=formatted_caption,
+                                    parse_mode=parse_mode,
+                                )
+                    else:
+                        # Local file — read bytes to avoid leaked file handles
+                        file_path = Path(item.path_or_url).expanduser()
+                        if not file_path.exists():
+                            logger.warning("[%s] Media file not found: %s", self.name, item.path_or_url)
+                            continue
+
+                        ext = file_path.suffix.lower()
+                        file_bytes = file_path.read_bytes()
+
+                        formatted_caption, parse_mode = self._prepare_caption(item.caption)
+                        if item.send_as_document or ext not in {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}:
+                            # Send as document
+                            media_obj = InputMediaDocument(
+                                media=file_bytes,
+                                caption=formatted_caption,
+                                parse_mode=parse_mode,
+                            )
+                        elif ext in {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}:
+                            # Video file
+                            media_obj = InputMediaVideo(
+                                media=file_bytes,
+                                caption=formatted_caption,
+                                parse_mode=parse_mode,
+                            )
+                        else:
+                            # Image file
+                            media_obj = InputMediaPhoto(
+                                media=file_bytes,
+                                caption=formatted_caption,
+                                parse_mode=parse_mode,
+                            )
+
+                    media_list.append(media_obj)
+
+                except Exception as item_error:
+                    logger.warning("[%s] Failed to prepare media item %s: %s", self.name, item.path_or_url, item_error)
+                    continue
+
+            if not media_list:
+                return SendResult(success=False, error="No valid media items to send")
+
+            # Send the media group
+            messages = await self._bot.send_media_group(
+                chat_id=int(chat_id),
+                media=media_list,
+                message_thread_id=int(_thread) if _thread else None,
+            )
+
+            # Return the first message ID
+            message_id = str(messages[0].message_id) if messages else None
+            return SendResult(success=True, message_id=message_id)
+
+        except Exception as e:
+            logger.warning("[%s] Telegram media group failed (may be MarkdownV2 caption issue): %s", self.name, e)
+
+            # Retry with plain-text captions — MarkdownV2 formatting in album
+            # captions is a common cause of API rejections.  Re-read file
+            # bytes (cheap) to avoid sharing consumed buffers with the failed
+            # first attempt.
+            try:
+                from pathlib import Path as _Path
+
+                plain_media_list = []
+                for item in media_items:
+                    try:
+                        plain_caption = item.caption[:1024] if item.caption and len(item.caption) > 1024 else item.caption
+
+                        if item.path_or_url.startswith('http'):
+                            if item.send_as_document:
+                                media_obj = InputMediaDocument(media=item.path_or_url, caption=plain_caption)
+                            elif any(item.path_or_url.lower().endswith(ext) for ext in ['.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp']):
+                                media_obj = InputMediaVideo(media=item.path_or_url, caption=plain_caption)
+                            else:
+                                media_obj = InputMediaPhoto(media=item.path_or_url, caption=plain_caption)
+                        else:
+                            fp = _Path(item.path_or_url).expanduser()
+                            if not fp.exists():
+                                continue
+                            file_bytes = fp.read_bytes()
+                            ext = fp.suffix.lower()
+                            if item.send_as_document or ext not in {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}:
+                                media_obj = InputMediaDocument(media=file_bytes, caption=plain_caption)
+                            elif ext in {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}:
+                                media_obj = InputMediaVideo(media=file_bytes, caption=plain_caption)
+                            else:
+                                media_obj = InputMediaPhoto(media=file_bytes, caption=plain_caption)
+
+                        plain_media_list.append(media_obj)
+                    except Exception:
+                        continue
+
+                if plain_media_list:
+                    _thread = metadata.get("thread_id") if metadata else None
+                    messages = await self._bot.send_media_group(
+                        chat_id=int(chat_id),
+                        media=plain_media_list,
+                        message_thread_id=int(_thread) if _thread else None,
+                    )
+                    message_id = str(messages[0].message_id) if messages else None
+                    return SendResult(success=True, message_id=message_id)
+            except Exception as retry_err:
+                logger.error("[%s] Plain-text retry also failed: %s", self.name, retry_err, exc_info=True)
+
+            # Final fallback: send items individually (no album)
+            logger.warning("[%s] Media group album failed, falling back to individual sends", self.name)
+            return await super().send_media_group(chat_id, media_items, metadata)
+
+    async def delete_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Delete a previously sent Telegram message."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            await self._bot.delete_message(
+                chat_id=int(chat_id),
+                message_id=int(message_id),
+            )
+            return SendResult(success=True, message_id=message_id)
+        except Exception as e:
+            logger.warning("[%s] Failed to delete Telegram message %s: %s", self.name, message_id, e)
+            return SendResult(success=False, error=str(e))
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Telegram chat."""
         if not self._bot:

@@ -99,6 +99,7 @@ class GatewayStreamConsumer:
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
+        self._response_message_id: Optional[str] = None
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -113,6 +114,13 @@ class GatewayStreamConsumer:
     def final_response_sent(self) -> bool:
         """True when the stream consumer delivered the final assistant reply."""
         return self._final_response_sent
+
+    @property
+    def response_message_id(self) -> Optional[str]:
+        """Message ID of the visible streamed assistant response, if any."""
+        if self._message_id == "__no_edit__":
+            return self._response_message_id
+        return self._message_id or self._response_message_id
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
@@ -462,6 +470,7 @@ class GatewayStreamConsumer:
             )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
+                self._response_message_id = str(result.message_id)
                 self._already_sent = True
                 self._last_sent_text = text
                 return str(result.message_id)
@@ -551,6 +560,7 @@ class GatewayStreamConsumer:
                     self._already_sent = True
                     self._final_response_sent = True
                     self._message_id = last_message_id
+                    self._response_message_id = last_message_id
                     self._last_sent_text = last_successful_chunk
                     self._fallback_prefix = ""
                     return
@@ -566,6 +576,7 @@ class GatewayStreamConsumer:
             last_message_id = result.message_id or last_message_id
 
         self._message_id = last_message_id
+        self._response_message_id = last_message_id
         self._already_sent = True
         self._final_response_sent = True
         self._last_sent_text = chunks[-1]
@@ -666,6 +677,8 @@ class GatewayStreamConsumer:
                     )
                     if result.success:
                         self._already_sent = True
+                        if self._message_id and self._message_id != "__no_edit__":
+                            self._response_message_id = self._message_id
                         self._last_sent_text = text
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0

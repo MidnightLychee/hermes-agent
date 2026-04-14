@@ -4087,11 +4087,15 @@ class GatewayRunner:
             # partial output before the failure).  Without this guard,
             # users see the agent "stop responding without explanation."
             if agent_result.get("already_sent") and not agent_result.get("failed"):
+                _sc = agent_result.get("stream_consumer")
                 if response:
                     _media_adapter = self.adapters.get(source.platform)
                     if _media_adapter:
                         await self._deliver_media_from_response(
-                            response, event, _media_adapter,
+                            response,
+                            event,
+                            _media_adapter,
+                            replace_message_id=getattr(_sc, "response_message_id", None),
                         )
                 return None
 
@@ -5461,76 +5465,228 @@ class GatewayRunner:
         response: str,
         event: MessageEvent,
         adapter,
+        replace_message_id: Optional[str] = None,
     ) -> None:
-        """Extract MEDIA: tags and local file paths from a response and deliver them.
+        """
+        Parse response into content blocks and deliver media with captions.
 
-        Called after streaming has already sent the text to the user, so the
-        text itself is already delivered — this only handles file attachments
-        that the normal _process_message_background path would have caught.
+        Called after streaming has already sent the text to the user, so we
+        parse the response into content blocks and deliver media with their
+        associated captions. If a caption was included in streamed text and
+        replace_message_id is provided, we delete the streamed message after
+        sending the captioned media.
         """
         from pathlib import Path
+        from gateway.platforms.base import TextBlock, ImageBlock, MediaGroupBlock
 
         try:
-            media_files, _ = adapter.extract_media(response)
-            _, cleaned = adapter.extract_images(response)
-            local_files, _ = adapter.extract_local_files(cleaned)
+            # Parse response into content blocks using the new parser
+            content_blocks = adapter._parse_content_blocks(response)
 
             _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+            _deleted_streamed_text = False
 
-            _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
-            _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
-            _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+            # When the response has both TextBlocks (prose) and media with
+            # captions, the streamed message contains the caption text that
+            # should only appear on images.  Edit the streamed message to
+            # keep only the TextBlock content, stripping caption lines.
+            _has_text_blocks = any(isinstance(b, TextBlock) for b in content_blocks)
+            _has_captioned_media = any(
+                (isinstance(b, ImageBlock) and b.caption)
+                or (isinstance(b, MediaGroupBlock) and b.items and b.items[0].caption)
+                for b in content_blocks
+            )
 
-            for media_path, is_voice in media_files:
+            if _has_text_blocks and _has_captioned_media and replace_message_id:
+                # Edit streamed message to text-only (remove caption lines)
+                text_only = "\n\n".join(
+                    b.text for b in content_blocks if isinstance(b, TextBlock)
+                )
+                if hasattr(adapter, 'edit_message'):
+                    try:
+                        edit_result = await adapter.edit_message(
+                            chat_id=event.source.chat_id,
+                            message_id=replace_message_id,
+                            content=text_only,
+                        )
+                        if edit_result.success:
+                            logger.debug(
+                                "[%s] Edited streamed message %s to text-only content",
+                                adapter.name, replace_message_id,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] Failed to edit streamed message %s: %s",
+                            adapter.name, replace_message_id, e,
+                        )
+                replace_message_id = None  # already handled, prevent deletion
+            elif _has_text_blocks:
+                replace_message_id = None  # prevent deletion
+
+            # Process content blocks sequentially
+            for block in content_blocks:
                 try:
-                    ext = Path(media_path).suffix.lower()
-                    if ext in _AUDIO_EXTS:
-                        await adapter.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                    elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(
-                            chat_id=event.source.chat_id,
-                            video_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                    elif ext in _IMAGE_EXTS:
-                        await adapter.send_image_file(
-                            chat_id=event.source.chat_id,
-                            image_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                    else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
-                        )
-                except Exception as e:
-                    logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    # Apply human-like pacing delay
+                    human_delay = adapter._get_human_delay()
+                    if human_delay > 0:
+                        await asyncio.sleep(human_delay)
 
-            for file_path in local_files:
-                try:
-                    ext = Path(file_path).suffix.lower()
-                    if ext in _IMAGE_EXTS:
-                        await adapter.send_image_file(
-                            chat_id=event.source.chat_id,
-                            image_path=file_path,
-                            metadata=_thread_meta,
-                        )
-                    else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=file_path,
-                            metadata=_thread_meta,
-                        )
-                except Exception as e:
-                    logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
+                    if isinstance(block, TextBlock):
+                        # TextBlock: Skip since text was already streamed
+                        continue
+
+                    elif isinstance(block, ImageBlock):
+                        # ImageBlock: Single image with optional caption
+                        path_or_url = block.path_or_url
+                        caption = block.caption
+                        send_as_document = block.send_as_document
+
+                        if path_or_url.startswith('http'):
+                            # URL-based image
+                            if adapter._is_animation_url(path_or_url):
+                                result = await adapter.send_animation(
+                                    chat_id=event.source.chat_id,
+                                    animation_url=path_or_url,
+                                    caption=caption,
+                                    metadata=_thread_meta,
+                                )
+                            else:
+                                result = await adapter.send_image(
+                                    chat_id=event.source.chat_id,
+                                    image_url=path_or_url,
+                                    caption=caption,
+                                    metadata=_thread_meta,
+                                )
+                        else:
+                            # Local file
+                            file_path = Path(path_or_url).expanduser()
+                            if not file_path.exists():
+                                logger.warning("[%s] Post-stream file not found: %s", adapter.name, path_or_url)
+                                continue
+
+                            ext = file_path.suffix.lower()
+                            if send_as_document or ext not in {'.jpg', '.jpeg', '.png', '.webp', '.gif', '.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}:
+                                result = await adapter.send_document(
+                                    chat_id=event.source.chat_id,
+                                    file_path=str(file_path),
+                                    caption=caption,
+                                    metadata=_thread_meta,
+                                )
+                            elif ext in {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}:
+                                result = await adapter.send_video(
+                                    chat_id=event.source.chat_id,
+                                    video_path=str(file_path),
+                                    caption=caption,
+                                    metadata=_thread_meta,
+                                )
+                            elif ext in {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}:
+                                result = await adapter.send_voice(
+                                    chat_id=event.source.chat_id,
+                                    audio_path=str(file_path),
+                                    caption=caption,
+                                    metadata=_thread_meta,
+                                )
+                            else:
+                                result = await adapter.send_image_file(
+                                    chat_id=event.source.chat_id,
+                                    image_path=str(file_path),
+                                    caption=caption,
+                                    metadata=_thread_meta,
+                                )
+
+                        # If this image had a caption and we successfully sent it,
+                        # delete the streamed text message if requested
+                        if (
+                            caption
+                            and replace_message_id
+                            and not _deleted_streamed_text
+                            and result.success
+                            and hasattr(adapter, 'delete_message')
+                        ):
+                            try:
+                                delete_result = await adapter.delete_message(
+                                    chat_id=event.source.chat_id,
+                                    message_id=replace_message_id,
+                                    metadata=_thread_meta,
+                                )
+                                if delete_result.success:
+                                    _deleted_streamed_text = True
+                                    logger.debug("[%s] Deleted streamed text message %s after sending captioned media", adapter.name, replace_message_id)
+                                else:
+                                    logger.warning("[%s] Failed to delete streamed text message %s: %s", adapter.name, replace_message_id, delete_result.error)
+                            except Exception as e:
+                                logger.warning("[%s] Error deleting streamed text message %s: %s", adapter.name, replace_message_id, e)
+
+                    elif isinstance(block, MediaGroupBlock):
+                        # MediaGroupBlock: Album of images/videos
+                        if hasattr(adapter, 'send_media_group'):
+                            result = await adapter.send_media_group(
+                                chat_id=event.source.chat_id,
+                                media_items=block.items,
+                                metadata=_thread_meta,
+                            )
+                        else:
+                            # Fallback: send items individually
+                            for item in block.items:
+                                if item.path_or_url.startswith('http'):
+                                    if adapter._is_animation_url(item.path_or_url):
+                                        await adapter.send_animation(
+                                            chat_id=event.source.chat_id,
+                                            animation_url=item.path_or_url,
+                                            caption=item.caption,
+                                            metadata=_thread_meta,
+                                        )
+                                    else:
+                                        await adapter.send_image(
+                                            chat_id=event.source.chat_id,
+                                            image_url=item.path_or_url,
+                                            caption=item.caption,
+                                            metadata=_thread_meta,
+                                        )
+                                else:
+                                    file_path = Path(item.path_or_url).expanduser()
+                                    if file_path.exists():
+                                        if item.send_as_document:
+                                            await adapter.send_document(
+                                                chat_id=event.source.chat_id,
+                                                file_path=str(file_path),
+                                                caption=item.caption,
+                                                metadata=_thread_meta,
+                                            )
+                                        else:
+                                            await adapter.send_image_file(
+                                                chat_id=event.source.chat_id,
+                                                image_path=str(file_path),
+                                                caption=item.caption,
+                                                metadata=_thread_meta,
+                                            )
+
+                        # Check if we need to delete streamed text for media group
+                        # (only if first item has caption)
+                        if (
+                            block.items
+                            and block.items[0].caption
+                            and replace_message_id
+                            and not _deleted_streamed_text
+                            and hasattr(adapter, 'delete_message')
+                        ):
+                            try:
+                                delete_result = await adapter.delete_message(
+                                    chat_id=event.source.chat_id,
+                                    message_id=replace_message_id,
+                                    metadata=_thread_meta,
+                                )
+                                if delete_result.success:
+                                    _deleted_streamed_text = True
+                                    logger.debug("[%s] Deleted streamed text message %s after sending captioned media group", adapter.name, replace_message_id)
+                            except Exception as e:
+                                logger.warning("[%s] Error deleting streamed text message %s for media group: %s", adapter.name, replace_message_id, e)
+
+                except Exception as block_err:
+                    logger.warning("[%s] Post-stream content block delivery failed: %s", adapter.name, block_err)
 
         except Exception as e:
-            logger.warning("Post-stream media extraction failed: %s", e)
+            logger.warning("Post-stream content block processing failed: %s", e)
 
     async def _handle_rollback_command(self, event: MessageEvent) -> str:
         """Handle /rollback command — list or restore filesystem checkpoints."""
@@ -8824,6 +8980,7 @@ class GatewayRunner:
                 "model": _resolved_model,
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
+                "stream_consumer": stream_consumer_holder[0],
             }
         
         # Start progress message sender if enabled
@@ -9324,6 +9481,7 @@ class GatewayRunner:
                 or getattr(_sc, "already_sent", False)
             ):
                 response["already_sent"] = True
+                response["stream_consumer"] = _sc
         
         return response
 
