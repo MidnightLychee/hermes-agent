@@ -28,6 +28,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
+    _MEDIA_GROUP_RULES,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -793,6 +794,97 @@ class TestEnvironmentHints:
         monkeypatch.setattr(_pb, "is_wsl", lambda: False)
         result = _pb.build_environment_hints()
         assert result == ""
+
+
+# =========================================================================
+# Media group / album caption protocol in platform hints
+# =========================================================================
+
+
+class TestMediaGroupRules:
+    """Verify that platform prompts teach models the per-item caption protocol."""
+
+    # Platforms that must carry the album rules (email is intentionally excluded)
+    MEDIA_PLATFORMS = ("telegram", "whatsapp", "discord", "slack", "signal", "bluebubbles")
+
+    def test_media_group_rules_constant_non_empty(self):
+        assert len(_MEDIA_GROUP_RULES) > 50
+
+    def test_media_group_rules_contains_example(self):
+        assert "A fluffy cat" in _MEDIA_GROUP_RULES
+        assert "A happy dog" in _MEDIA_GROUP_RULES
+        assert "MEDIA:/tmp/cat.png" in _MEDIA_GROUP_RULES
+
+    def test_media_group_rules_forbids_blank_lines(self):
+        assert "blank line" in _MEDIA_GROUP_RULES
+
+    def test_media_group_rules_forbids_prose_between_items(self):
+        assert "prose" in _MEDIA_GROUP_RULES or "commentary" in _MEDIA_GROUP_RULES
+
+    def test_media_group_rules_forbids_markdown_image_for_local(self):
+        # New wording uses ![alt](path) since we're talking about local files
+        assert "![alt](path)" in _MEDIA_GROUP_RULES or "![alt](url)" in _MEDIA_GROUP_RULES
+        assert "MEDIA:/path" in _MEDIA_GROUP_RULES
+
+    def test_media_group_rules_example_precedes_rules(self):
+        """Small models mimic recent structure — example must come BEFORE the rules list."""
+        idx_example = _MEDIA_GROUP_RULES.find("MEDIA:/tmp/cat.png")
+        idx_rules = _MEDIA_GROUP_RULES.find("Rules:")
+        assert idx_example != -1 and idx_rules != -1
+        assert idx_example < idx_rules, "Example must appear before the Rules list"
+
+    def test_media_group_rules_mentions_markdownv2(self):
+        """Captions support MarkdownV2 — the prompt must tell models."""
+        assert "MarkdownV2" in _MEDIA_GROUP_RULES
+
+    def test_media_group_rules_has_trigger_phrase(self):
+        """The prompt must have an explicit WHEN → DO trigger for small models."""
+        # Something like "2 or more" / "ALWAYS" that makes the trigger unambiguous
+        assert "2 or more" in _MEDIA_GROUP_RULES
+        assert "ALWAYS" in _MEDIA_GROUP_RULES
+
+    def test_media_group_rules_references_skill(self):
+        """Claude/GPT models can then skill_view the full workflow."""
+        assert "telegram-media-group-captions" in _MEDIA_GROUP_RULES
+        assert "skill_view" in _MEDIA_GROUP_RULES
+
+    @pytest.mark.parametrize("platform", MEDIA_PLATFORMS)
+    def test_platform_hint_contains_media_prefix(self, platform):
+        hint = PLATFORM_HINTS[platform]
+        assert "MEDIA:" in hint
+
+    @pytest.mark.parametrize("platform", MEDIA_PLATFORMS)
+    def test_platform_hint_contains_per_item_caption_guidance(self, platform):
+        hint = PLATFORM_HINTS[platform]
+        # Either old ("per-image caption" / "immediately after") or new
+        # ("directly after" / "2 or more media") phrasing is acceptable
+        assert any(
+            phrase in hint
+            for phrase in ("per-image caption", "immediately after", "directly after", "2 or more media")
+        )
+
+    @pytest.mark.parametrize("platform", MEDIA_PLATFORMS)
+    def test_platform_hint_contains_album_example(self, platform):
+        hint = PLATFORM_HINTS[platform]
+        assert "A fluffy cat" in hint
+
+    @pytest.mark.parametrize("platform", ("telegram", "whatsapp", "discord", "slack", "signal"))
+    def test_platform_hint_still_mentions_remote_url_syntax(self, platform):
+        """Legacy ![alt](url) remote-URL support must stay in the prompt."""
+        hint = PLATFORM_HINTS[platform]
+        assert "![alt](url)" in hint
+
+    def test_email_hint_does_not_contain_album_rules(self):
+        """Email attachments don't form albums — rules must not bleed in."""
+        email_hint = PLATFORM_HINTS["email"]
+        assert "A fluffy cat" not in email_hint
+        assert "per-image caption" not in email_hint
+
+    @pytest.mark.parametrize("platform", MEDIA_PLATFORMS)
+    def test_platform_hint_growth_under_1500_chars(self, platform):
+        """Sanity-check: per-platform hint must not balloon past ~1500 extra chars."""
+        hint = PLATFORM_HINTS[platform]
+        assert len(hint) < 1500, f"{platform} hint is {len(hint)} chars — too long"
 
 
 # =========================================================================
