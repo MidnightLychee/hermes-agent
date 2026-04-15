@@ -18,7 +18,8 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from typing import Callable, Dict, Optional, Any
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ import re
 from gateway.platforms.helpers import MessageDeduplicator, ThreadParticipationTracker
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    MediaGroupItem,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
@@ -1475,6 +1477,151 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send document, falling back to base adapter: %s", self.name, e, exc_info=True)
             return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
+
+    async def send_media_group(
+        self,
+        chat_id: str,
+        media_items: List[MediaGroupItem],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send up to 10 media items as a single Discord message with
+        multiple attachments.  Discord renders multiple attachments inline
+        as a grid, which is the closest native analogue to a Telegram album.
+
+        Per-item captions: Discord has no per-attachment visible caption,
+        but each ``discord.File`` accepts a ``description`` (alt text).  We
+        put the caption there for accessibility, and also render a numbered
+        caption legend as the message ``content`` when items have captions,
+        so users see them next to the grid.
+
+        The parser caps groups at 10 before calling this, but we defensively
+        split any oversized input by delegating to the base adapter's
+        fallback (which sends leftover items individually).
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        if not media_items:
+            return SendResult(success=True)
+
+        if len(media_items) > 10:
+            for i in range(0, len(media_items), 10):
+                chunk = media_items[i:i + 10]
+                r = await self.send_media_group(chat_id, chunk, metadata=metadata)
+                if not r.success:
+                    return r
+            return SendResult(success=True)
+
+        try:
+            import io
+            import aiohttp
+            from gateway.platforms.base import (
+                resolve_proxy_url,
+                proxy_kwargs_for_aiohttp,
+            )
+
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            if not channel:
+                return SendResult(success=False, error=f"Channel {chat_id} not found")
+
+            files: List[Any] = []
+            _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+            _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+
+            any_caption = any(item.caption for item in media_items)
+            all_captioned = all(item.caption for item in media_items)
+
+            async def _fetch_url(url: str) -> Tuple[bytes, str]:
+                if not is_safe_url(url):
+                    raise RuntimeError(f"Blocked unsafe URL: {url}")
+                async with aiohttp.ClientSession(**_sess_kw) as sess:
+                    async with sess.get(
+                        url,
+                        timeout=aiohttp.ClientTimeout(total=30),
+                        **_req_kw,
+                    ) as resp:
+                        if resp.status != 200:
+                            raise RuntimeError(
+                                f"Failed to download {url}: HTTP {resp.status}"
+                            )
+                        data = await resp.read()
+                        ctype = resp.headers.get("content-type", "")
+                        ext = "png"
+                        for k, v in (
+                            ("jpeg", "jpg"), ("jpg", "jpg"), ("gif", "gif"),
+                            ("webp", "webp"), ("mp4", "mp4"), ("webm", "webm"),
+                        ):
+                            if k in ctype:
+                                ext = v
+                                break
+                        return data, f"image.{ext}"
+
+            for idx, item in enumerate(media_items):
+                path = item.path_or_url
+                if path.startswith("http"):
+                    try:
+                        data, fname = await _fetch_url(path)
+                    except Exception as e:
+                        logger.warning(
+                            "[%s] media group: download failed for %s: %s",
+                            self.name, path, e,
+                        )
+                        continue
+                    files.append(
+                        discord.File(
+                            io.BytesIO(data),
+                            filename=fname,
+                            description=(item.caption or "")[:1024] or None,
+                        )
+                    )
+                else:
+                    fp = Path(path).expanduser()
+                    if not fp.exists():
+                        logger.warning(
+                            "[%s] media group: file not found: %s",
+                            self.name, path,
+                        )
+                        continue
+                    files.append(
+                        discord.File(
+                            str(fp),
+                            filename=fp.name,
+                            description=(item.caption or "")[:1024] or None,
+                        )
+                    )
+
+            if not files:
+                return SendResult(
+                    success=False, error="No media items could be prepared"
+                )
+
+            # Compose the visible message body.  If every item has a caption,
+            # emit a numbered legend so readers can match caption → image.
+            # If only the first item has a caption (legacy trailing-text
+            # shape), use it as the single message content.
+            content: Optional[str] = None
+            if all_captioned and len(media_items) > 1:
+                legend_lines = [
+                    f"{i + 1}. {item.caption}"
+                    for i, item in enumerate(media_items)
+                    if item.caption
+                ]
+                content = "\n".join(legend_lines) if legend_lines else None
+            elif any_caption:
+                content = media_items[0].caption
+
+            msg = await channel.send(content=content, files=files)
+            return SendResult(success=True, message_id=str(msg.id))
+
+        except Exception as e:
+            logger.error(
+                "[%s] send_media_group failed, falling back to per-item: %s",
+                self.name, e, exc_info=True,
+            )
+            return await super().send_media_group(
+                chat_id, media_items, metadata=metadata,
+            )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Start a persistent typing indicator for a channel.
