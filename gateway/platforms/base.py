@@ -1915,6 +1915,118 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
+                # Album delivery: when the response parses into a
+                # MediaGroupBlock, route through _parse_content_blocks so the
+                # album is sent as a single sendMediaGroup call with per-item
+                # captions.  The old extract_media/extract_images pipeline
+                # below does not understand albums — it would emit captions
+                # as one text blob and ship each photo as an individual send.
+                _album_blocks = self._parse_content_blocks(response)
+                if any(isinstance(b, MediaGroupBlock) for b in _album_blocks):
+                    human_delay = self._get_human_delay()
+                    _first_send = True
+                    for block in _album_blocks:
+                        if human_delay > 0 and not _first_send:
+                            await asyncio.sleep(human_delay)
+                        _first_send = False
+                        if isinstance(block, TextBlock):
+                            text = re.sub(r"MEDIA:\s*\S+", "", block.text).strip()
+                            if not text:
+                                continue
+                            result = await self._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=text,
+                                reply_to=event.message_id,
+                                metadata=_thread_metadata,
+                            )
+                            _record_delivery(result)
+                        elif isinstance(block, MediaGroupBlock):
+                            try:
+                                mg_result = await self.send_media_group(
+                                    chat_id=event.source.chat_id,
+                                    media_items=block.items,
+                                    metadata=_thread_metadata,
+                                )
+                                if not mg_result.success:
+                                    logger.warning(
+                                        "[%s] send_media_group failed: %s",
+                                        self.name, mg_result.error,
+                                    )
+                            except Exception as mg_err:
+                                logger.error(
+                                    "[%s] Error sending media group: %s",
+                                    self.name, mg_err, exc_info=True,
+                                )
+                        elif isinstance(block, ImageBlock):
+                            try:
+                                path = block.path_or_url
+                                caption = block.caption
+                                if path.startswith("http"):
+                                    if self._is_animation_url(path):
+                                        await self.send_animation(
+                                            chat_id=event.source.chat_id,
+                                            animation_url=path,
+                                            caption=caption,
+                                            metadata=_thread_metadata,
+                                        )
+                                    else:
+                                        await self.send_image(
+                                            chat_id=event.source.chat_id,
+                                            image_url=path,
+                                            caption=caption,
+                                            metadata=_thread_metadata,
+                                        )
+                                else:
+                                    ext = Path(path).suffix.lower()
+                                    if block.send_as_document:
+                                        await self.send_document(
+                                            chat_id=event.source.chat_id,
+                                            file_path=path,
+                                            caption=caption,
+                                            metadata=_thread_metadata,
+                                        )
+                                    elif ext in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}:
+                                        await self.send_video(
+                                            chat_id=event.source.chat_id,
+                                            video_path=path,
+                                            caption=caption,
+                                            metadata=_thread_metadata,
+                                        )
+                                    elif ext in {".ogg", ".opus", ".mp3", ".wav", ".m4a"}:
+                                        await self.send_voice(
+                                            chat_id=event.source.chat_id,
+                                            audio_path=path,
+                                            metadata=_thread_metadata,
+                                        )
+                                    else:
+                                        await self.send_image_file(
+                                            chat_id=event.source.chat_id,
+                                            image_path=path,
+                                            caption=caption,
+                                            metadata=_thread_metadata,
+                                        )
+                            except Exception as ib_err:
+                                logger.error(
+                                    "[%s] Error sending image block: %s",
+                                    self.name, ib_err, exc_info=True,
+                                )
+
+                    processing_ok = True
+                    await self._run_processing_hook(
+                        "on_processing_complete",
+                        event,
+                        ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
+                    )
+                    # Skip the legacy extract_media/extract_images pipeline —
+                    # this response has already been fully delivered.
+                    if session_key in self._pending_messages:
+                        pending_event = self._pending_messages.pop(session_key)
+                        logger.debug("[%s] Processing queued message from interrupt", self.name)
+                        if session_key in self._active_sessions:
+                            del self._active_sessions[session_key]
+                        asyncio.create_task(self._process_message_background(pending_event, session_key))
+                    return
+
                 # Extract MEDIA:<path> tags (from TTS tool) before other processing
                 media_files, response = self.extract_media(response)
                 
