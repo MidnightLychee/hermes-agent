@@ -28,6 +28,7 @@ import httpx
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    MediaGroupItem,
     MessageEvent,
     MessageType,
     SendResult,
@@ -684,6 +685,116 @@ class SignalAdapter(BasePlatformAdapter):
             self._track_sent_timestamp(result)
             return SendResult(success=True)
         return SendResult(success=False, error="RPC send with attachment failed")
+
+    async def send_media_group(
+        self,
+        chat_id: str,
+        media_items: List[MediaGroupItem],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send multiple attachments in a single Signal message.
+
+        signal-cli's ``send`` RPC accepts ``attachments`` as a list, so all
+        items arrive in one message with a shared attachment strip.  Signal
+        does not render per-item captions; instead we fold per-item captions
+        into the single ``message`` field as a numbered legend so the user
+        can still see the mapping.
+
+        Falls back to the base adapter's per-item loop if the RPC fails.
+        """
+        if not media_items:
+            return SendResult(success=True)
+
+        await self._stop_typing_indicator(chat_id)
+
+        attachments: List[str] = []
+        skipped = 0
+        for item in media_items:
+            path = item.path_or_url
+            try:
+                if path.startswith("http"):
+                    try:
+                        path = await cache_image_from_url(path)
+                    except Exception as e:
+                        logger.warning(
+                            "Signal media_group: download failed for %s: %s",
+                            item.path_or_url, e,
+                        )
+                        skipped += 1
+                        continue
+                elif path.startswith("file://"):
+                    path = unquote(path[7:])
+
+                if not path or not Path(path).exists():
+                    logger.warning(
+                        "Signal media_group: file not found: %s",
+                        item.path_or_url,
+                    )
+                    skipped += 1
+                    continue
+
+                if Path(path).stat().st_size > SIGNAL_MAX_ATTACHMENT_SIZE:
+                    logger.warning(
+                        "Signal media_group: skipping oversized file: %s",
+                        path,
+                    )
+                    skipped += 1
+                    continue
+
+                attachments.append(path)
+            except Exception as e:
+                logger.warning(
+                    "Signal media_group: failed to prepare %s: %s",
+                    item.path_or_url, e,
+                )
+                skipped += 1
+
+        if not attachments:
+            return SendResult(
+                success=False, error="No attachments could be prepared"
+            )
+
+        any_caption = any(item.caption for item in media_items)
+        all_captioned = all(item.caption for item in media_items)
+        if all_captioned and len(media_items) > 1:
+            message_text = "\n".join(
+                f"{i + 1}. {item.caption}"
+                for i, item in enumerate(media_items)
+                if item.caption
+            )
+        elif any_caption:
+            message_text = media_items[0].caption or ""
+        else:
+            message_text = ""
+
+        params: Dict[str, Any] = {
+            "account": self.account,
+            "message": message_text,
+            "attachments": attachments,
+        }
+        if chat_id.startswith("group:"):
+            params["groupId"] = chat_id[6:]
+        else:
+            params["recipient"] = [chat_id]
+
+        try:
+            result = await self._rpc("send", params)
+        except Exception as e:
+            logger.error(
+                "Signal media_group: RPC failed, falling back: %s", e,
+            )
+            return await super().send_media_group(
+                chat_id, media_items, metadata=metadata,
+            )
+        if result is not None:
+            self._track_sent_timestamp(result)
+            return SendResult(success=True)
+        logger.warning(
+            "Signal media_group: RPC returned None, falling back",
+        )
+        return await super().send_media_group(
+            chat_id, media_items, metadata=metadata,
+        )
 
     async def _send_attachment(
         self,
