@@ -15,7 +15,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from slack_bolt.async_app import AsyncApp
@@ -36,6 +36,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    MediaGroupItem,
     MessageEvent,
     MessageType,
     SendResult,
@@ -779,6 +780,116 @@ class SlackAdapter(BasePlatformAdapter):
             if caption:
                 text = f"{caption}\n{text}"
             return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+
+    async def send_media_group(
+        self,
+        chat_id: str,
+        media_items: List[MediaGroupItem],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Upload multiple files in a single Slack message via
+        ``files_upload_v2``'s batch shape.  One ``initial_comment`` is shared
+        by the upload; each file's own caption becomes its ``title`` so it
+        renders beneath the individual attachment.
+
+        URL-based items are fetched first (SSRF-checked) into memory so they
+        can ride the same batch upload.  Missing or unsafe items are skipped
+        rather than tanking the whole group.  Falls back to the base
+        adapter's per-item loop on any fatal error.
+        """
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+        if not media_items:
+            return SendResult(success=True)
+
+        from tools.url_safety import is_safe_url
+
+        file_uploads: List[Dict[str, Any]] = []
+
+        try:
+            import httpx
+        except ImportError:
+            httpx = None  # type: ignore[assignment]
+
+        for item in media_items:
+            path = item.path_or_url
+            title = item.caption or None
+            try:
+                if path.startswith("http"):
+                    if not is_safe_url(path):
+                        logger.warning(
+                            "[Slack] media_group: blocked unsafe URL %s",
+                            safe_url_for_log(path),
+                        )
+                        continue
+                    if httpx is None:
+                        logger.warning(
+                            "[Slack] media_group: httpx unavailable, skipping URL item"
+                        )
+                        continue
+                    async with httpx.AsyncClient(
+                        timeout=30.0, follow_redirects=True,
+                    ) as client:
+                        resp = await client.get(path)
+                        resp.raise_for_status()
+                        data = resp.content
+                    filename = os.path.basename(path.split("?", 1)[0]) or "image.png"
+                    file_uploads.append(
+                        {"content": data, "filename": filename, "title": title}
+                    )
+                else:
+                    if not os.path.exists(path):
+                        logger.warning(
+                            "[Slack] media_group: file not found: %s", path
+                        )
+                        continue
+                    file_uploads.append(
+                        {
+                            "file": path,
+                            "filename": os.path.basename(path),
+                            "title": title,
+                        }
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[Slack] media_group: failed to prepare %s: %s", path, e,
+                )
+                continue
+
+        if not file_uploads:
+            return SendResult(
+                success=False, error="No attachments could be prepared"
+            )
+
+        any_caption = any(item.caption for item in media_items)
+        all_captioned = all(item.caption for item in media_items)
+        if all_captioned and len(media_items) > 1:
+            initial_comment = "\n".join(
+                f"{i + 1}. {item.caption}"
+                for i, item in enumerate(media_items)
+                if item.caption
+            )
+        elif any_caption:
+            initial_comment = media_items[0].caption or ""
+        else:
+            initial_comment = ""
+
+        try:
+            result = await self._get_client(chat_id).files_upload_v2(
+                channel=chat_id,
+                file_uploads=file_uploads,
+                initial_comment=initial_comment,
+                thread_ts=self._resolve_thread_ts(None, metadata),
+            )
+            return SendResult(success=True, raw_response=result)
+        except Exception as e:
+            logger.error(
+                "[Slack] files_upload_v2 batch failed, falling back to "
+                "per-item: %s", e, exc_info=True,
+            )
+            return await super().send_media_group(
+                chat_id, media_items, metadata=metadata,
+            )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Slack channel."""
