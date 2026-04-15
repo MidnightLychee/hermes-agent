@@ -1220,6 +1220,231 @@ class BasePlatformAdapter(ABC):
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
 
+    async def dispatch_content_blocks(
+        self,
+        blocks: "List[ContentBlock]",
+        *,
+        chat_id: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        send_text: bool = True,
+        replace_message_id: Optional[str] = None,
+    ) -> Tuple[bool, bool]:
+        """Walk parsed content blocks and dispatch each to the right send_*.
+
+        Single source of truth for block-based delivery. Used by both the
+        non-streaming path (_process_message_background) and the streaming
+        path (gateway/run.py::_deliver_media_from_response).
+
+        Args:
+            blocks: Output of _parse_content_blocks.
+            chat_id: Platform-specific chat identifier.
+            reply_to: Inbound message id to reply to (text block only).
+            metadata: Platform-specific metadata (e.g. {"thread_id": ...}).
+            send_text: True to deliver TextBlocks; False when streaming
+                already showed them to the user.
+            replace_message_id: Previously-streamed message to edit down to
+                text-only (if TextBlocks + captioned media coexist) or
+                delete (first captioned media after). Ignored when
+                send_text=True since no prior message exists.
+
+        Returns:
+            (attempted, any_succeeded) — lets the caller's delivery tracker
+            decide the processing-hook outcome.
+        """
+        from pathlib import Path as _Path
+
+        _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+        _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
+        _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
+
+        attempted = False
+        any_succeeded = False
+        deleted_streamed_text = False
+
+        has_text = any(isinstance(b, TextBlock) for b in blocks)
+        has_captioned_media = any(
+            (isinstance(b, ImageBlock) and b.caption)
+            or (isinstance(b, MediaGroupBlock) and b.items and b.items[0].caption)
+            for b in blocks
+        )
+
+        # Streaming case: the text has already been sent as part of the live
+        # stream.  When it mixed prose and caption lines, edit the streamed
+        # message down to only the TextBlock content; otherwise leave it
+        # alone.  Either way, don't let subsequent media-send blocks delete
+        # it.
+        if not send_text and replace_message_id and has_text and has_captioned_media:
+            text_only = "\n\n".join(
+                b.text for b in blocks if isinstance(b, TextBlock)
+            )
+            try:
+                edit_result = await self.edit_message(
+                    chat_id=chat_id,
+                    message_id=replace_message_id,
+                    content=text_only,
+                )
+                if edit_result.success:
+                    logger.debug(
+                        "[%s] Edited streamed message %s to text-only content",
+                        self.name, replace_message_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[%s] Failed to edit streamed message %s: %s",
+                    self.name, replace_message_id, e,
+                )
+            replace_message_id = None
+        elif not send_text and has_text:
+            replace_message_id = None
+
+        first = True
+        for block in blocks:
+            try:
+                if not first:
+                    delay = self._get_human_delay()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+                result = None
+
+                if isinstance(block, TextBlock):
+                    if not send_text:
+                        continue
+                    text = re.sub(r"MEDIA:\s*\S+", "", block.text).strip()
+                    if not text:
+                        continue
+                    result = await self._send_with_retry(
+                        chat_id=chat_id,
+                        content=text,
+                        reply_to=reply_to,
+                        metadata=metadata,
+                    )
+
+                elif isinstance(block, ImageBlock):
+                    path = block.path_or_url
+                    caption = block.caption
+                    if path.startswith("http"):
+                        if self._is_animation_url(path):
+                            result = await self.send_animation(
+                                chat_id=chat_id,
+                                animation_url=path,
+                                caption=caption,
+                                metadata=metadata,
+                            )
+                        else:
+                            result = await self.send_image(
+                                chat_id=chat_id,
+                                image_url=path,
+                                caption=caption,
+                                metadata=metadata,
+                            )
+                    else:
+                        fp = _Path(path).expanduser()
+                        if not fp.exists():
+                            logger.warning(
+                                "[%s] File not found for ImageBlock: %s",
+                                self.name, path,
+                            )
+                            continue
+                        ext = fp.suffix.lower()
+                        if block.send_as_document or ext not in (_IMAGE_EXTS | _VIDEO_EXTS | _AUDIO_EXTS):
+                            result = await self.send_document(
+                                chat_id=chat_id,
+                                file_path=str(fp),
+                                caption=caption,
+                                metadata=metadata,
+                            )
+                        elif ext in _VIDEO_EXTS:
+                            result = await self.send_video(
+                                chat_id=chat_id,
+                                video_path=str(fp),
+                                caption=caption,
+                                metadata=metadata,
+                            )
+                        elif ext in _AUDIO_EXTS:
+                            result = await self.send_voice(
+                                chat_id=chat_id,
+                                audio_path=str(fp),
+                                metadata=metadata,
+                            )
+                        else:
+                            result = await self.send_image_file(
+                                chat_id=chat_id,
+                                image_path=str(fp),
+                                caption=caption,
+                                metadata=metadata,
+                            )
+
+                    if (
+                        caption
+                        and replace_message_id
+                        and not deleted_streamed_text
+                        and result is not None
+                        and result.success
+                    ):
+                        try:
+                            del_r = await self.delete_message(
+                                chat_id=chat_id,
+                                message_id=replace_message_id,
+                                metadata=metadata,
+                            )
+                            if del_r.success:
+                                deleted_streamed_text = True
+                                logger.debug(
+                                    "[%s] Deleted streamed text message %s after captioned image",
+                                    self.name, replace_message_id,
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "[%s] Error deleting streamed text message %s: %s",
+                                self.name, replace_message_id, e,
+                            )
+
+                elif isinstance(block, MediaGroupBlock):
+                    result = await self.send_media_group(
+                        chat_id=chat_id,
+                        media_items=block.items,
+                        metadata=metadata,
+                    )
+                    if (
+                        block.items
+                        and block.items[0].caption
+                        and replace_message_id
+                        and not deleted_streamed_text
+                    ):
+                        try:
+                            del_r = await self.delete_message(
+                                chat_id=chat_id,
+                                message_id=replace_message_id,
+                                metadata=metadata,
+                            )
+                            if del_r.success:
+                                deleted_streamed_text = True
+                                logger.debug(
+                                    "[%s] Deleted streamed text message %s after captioned album",
+                                    self.name, replace_message_id,
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "[%s] Error deleting streamed text message %s for album: %s",
+                                self.name, replace_message_id, e,
+                            )
+
+                if result is not None:
+                    attempted = True
+                    if result.success:
+                        any_succeeded = True
+                    first = False
+
+            except Exception as block_err:
+                logger.error(
+                    "[%s] Content block dispatch failed: %s",
+                    self.name, block_err, exc_info=True,
+                )
+
+        return attempted, any_succeeded
+
     async def send_media_group(
         self,
         chat_id: str,
@@ -1915,110 +2140,31 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
-                # Album delivery: when the response parses into a
-                # MediaGroupBlock, route through _parse_content_blocks so the
-                # album is sent as a single sendMediaGroup call with per-item
-                # captions.  The old extract_media/extract_images pipeline
-                # below does not understand albums — it would emit captions
-                # as one text blob and ship each photo as an individual send.
+                # Album-shaped responses (containing MediaGroupBlock) must go
+                # through dispatch_content_blocks — the legacy extract_media /
+                # extract_images pipeline below has no understanding of albums
+                # and would dump captions as a single text blob while sending
+                # every photo as an individual send_image_file.
                 _album_blocks = self._parse_content_blocks(response)
                 if any(isinstance(b, MediaGroupBlock) for b in _album_blocks):
-                    human_delay = self._get_human_delay()
-                    _first_send = True
-                    for block in _album_blocks:
-                        if human_delay > 0 and not _first_send:
-                            await asyncio.sleep(human_delay)
-                        _first_send = False
-                        if isinstance(block, TextBlock):
-                            text = re.sub(r"MEDIA:\s*\S+", "", block.text).strip()
-                            if not text:
-                                continue
-                            result = await self._send_with_retry(
-                                chat_id=event.source.chat_id,
-                                content=text,
-                                reply_to=event.message_id,
-                                metadata=_thread_metadata,
-                            )
-                            _record_delivery(result)
-                        elif isinstance(block, MediaGroupBlock):
-                            try:
-                                mg_result = await self.send_media_group(
-                                    chat_id=event.source.chat_id,
-                                    media_items=block.items,
-                                    metadata=_thread_metadata,
-                                )
-                                if not mg_result.success:
-                                    logger.warning(
-                                        "[%s] send_media_group failed: %s",
-                                        self.name, mg_result.error,
-                                    )
-                            except Exception as mg_err:
-                                logger.error(
-                                    "[%s] Error sending media group: %s",
-                                    self.name, mg_err, exc_info=True,
-                                )
-                        elif isinstance(block, ImageBlock):
-                            try:
-                                path = block.path_or_url
-                                caption = block.caption
-                                if path.startswith("http"):
-                                    if self._is_animation_url(path):
-                                        await self.send_animation(
-                                            chat_id=event.source.chat_id,
-                                            animation_url=path,
-                                            caption=caption,
-                                            metadata=_thread_metadata,
-                                        )
-                                    else:
-                                        await self.send_image(
-                                            chat_id=event.source.chat_id,
-                                            image_url=path,
-                                            caption=caption,
-                                            metadata=_thread_metadata,
-                                        )
-                                else:
-                                    ext = Path(path).suffix.lower()
-                                    if block.send_as_document:
-                                        await self.send_document(
-                                            chat_id=event.source.chat_id,
-                                            file_path=path,
-                                            caption=caption,
-                                            metadata=_thread_metadata,
-                                        )
-                                    elif ext in {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}:
-                                        await self.send_video(
-                                            chat_id=event.source.chat_id,
-                                            video_path=path,
-                                            caption=caption,
-                                            metadata=_thread_metadata,
-                                        )
-                                    elif ext in {".ogg", ".opus", ".mp3", ".wav", ".m4a"}:
-                                        await self.send_voice(
-                                            chat_id=event.source.chat_id,
-                                            audio_path=path,
-                                            metadata=_thread_metadata,
-                                        )
-                                    else:
-                                        await self.send_image_file(
-                                            chat_id=event.source.chat_id,
-                                            image_path=path,
-                                            caption=caption,
-                                            metadata=_thread_metadata,
-                                        )
-                            except Exception as ib_err:
-                                logger.error(
-                                    "[%s] Error sending image block: %s",
-                                    self.name, ib_err, exc_info=True,
-                                )
-
-                    processing_ok = True
+                    _attempted, _succeeded = await self.dispatch_content_blocks(
+                        _album_blocks,
+                        chat_id=event.source.chat_id,
+                        reply_to=event.message_id,
+                        metadata=_thread_metadata,
+                        send_text=True,
+                        replace_message_id=None,
+                    )
+                    if _attempted:
+                        delivery_attempted = True
+                        if _succeeded:
+                            delivery_succeeded = True
+                    processing_ok = delivery_succeeded if delivery_attempted else True
                     await self._run_processing_hook(
                         "on_processing_complete",
                         event,
                         ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
                     )
-                    # Skip the legacy extract_media/extract_images pipeline —
-                    # this response has already been fully delivered.
                     if session_key in self._pending_messages:
                         pending_event = self._pending_messages.pop(session_key)
                         logger.debug("[%s] Processing queued message from interrupt", self.name)
