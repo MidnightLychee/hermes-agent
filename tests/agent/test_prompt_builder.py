@@ -844,8 +844,11 @@ class TestMediaGroupRules:
         assert "ALWAYS" in _MEDIA_GROUP_RULES
 
     def test_media_group_rules_references_skill(self):
-        """Claude/GPT models can then skill_view the full workflow."""
-        assert "telegram-media-group-captions" in _MEDIA_GROUP_RULES
+        """Small models (gemma, etc.) rely on the skill name appearing in
+        the rules text so they can skill_view the full workflow. The named
+        skill must actually exist — a dangling reference misleads models
+        that try to look it up. See skills/autonomous-ai-agents/hermes-agent/send-media-group/SKILL.md."""
+        assert "send-media-group" in _MEDIA_GROUP_RULES
         assert "skill_view" in _MEDIA_GROUP_RULES
 
     @pytest.mark.parametrize("platform", MEDIA_PLATFORMS)

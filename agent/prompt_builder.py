@@ -304,7 +304,7 @@ _MEDIA_GROUP_RULES = (
     "- Captions support MarkdownV2 (**bold**, _italic_, `code`, ||spoiler||)\n"
     "\n"
     "For complex multi-image delivery workflows, consult the "
-    "telegram-media-group-captions skill via skill_view."
+    "send-media-group skill via skill_view."
 )
 
 PLATFORM_HINTS = {
