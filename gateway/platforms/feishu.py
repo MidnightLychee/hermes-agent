@@ -96,6 +96,7 @@ FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    MediaGroupItem,
     MessageEvent,
     MessageType,
     SendResult,
@@ -1644,6 +1645,137 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to send image %s: %s", image_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    async def send_media_group(
+        self,
+        chat_id: str,
+        media_items: List[MediaGroupItem],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send multiple images as a single Feishu post message with
+        interleaved caption/image rows.
+
+        Feishu's ``post`` message type renders each row of its ``content``
+        array as a paragraph, and an ``img`` row embeds an uploaded image
+        inline.  That lets us deliver N captioned images in a single chat
+        bubble — more expressive than Telegram's shared-caption album.
+
+        Protocol: upload each image via ``im.v1.image.create`` to get an
+        ``image_key``, then send one post whose content interleaves
+        ``[text(caption)]`` and ``[img(image_key)]`` rows.
+
+        Non-image items (video/audio/document) cannot be inlined in a post,
+        so any such item triggers the base per-item fallback.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        if not media_items:
+            return SendResult(success=True)
+
+        _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+        def _is_inlineable(item: MediaGroupItem) -> bool:
+            if item.send_as_document:
+                return False
+            path = item.path_or_url
+            if path.startswith("http"):
+                # Trust the parser: MediaGroupBlock only groups media-shaped items.
+                return True
+            return Path(path).suffix.lower() in _IMAGE_EXTS
+
+        if not all(_is_inlineable(item) for item in media_items):
+            logger.debug(
+                "[Feishu] album contains non-image items, falling back to per-item"
+            )
+            return await super().send_media_group(
+                chat_id, media_items, metadata=metadata,
+            )
+
+        import io as _io
+
+        content_rows: List[List[Dict[str, str]]] = []
+        uploaded = 0
+
+        for item in media_items:
+            try:
+                path = item.path_or_url
+                if path.startswith("http"):
+                    try:
+                        path = await cache_image_from_url(path)
+                    except Exception as e:
+                        logger.warning(
+                            "[Feishu] album: download failed for %s: %s",
+                            item.path_or_url, e,
+                        )
+                        continue
+                if not path or not os.path.exists(path):
+                    logger.warning(
+                        "[Feishu] album: file not found: %s", item.path_or_url,
+                    )
+                    continue
+
+                with open(path, "rb") as f:
+                    image_bytes = f.read()
+                image_file = _io.BytesIO(image_bytes)
+                image_file.name = os.path.basename(path)
+                body = self._build_image_upload_body(
+                    image_type=_FEISHU_IMAGE_UPLOAD_TYPE,
+                    image=image_file,
+                )
+                request = self._build_image_upload_request(body)
+                upload_response = await asyncio.to_thread(
+                    self._client.im.v1.image.create, request,
+                )
+                image_key = self._extract_response_field(upload_response, "image_key")
+                if not image_key:
+                    logger.warning(
+                        "[Feishu] album: upload missing image_key for %s",
+                        item.path_or_url,
+                    )
+                    continue
+
+                if item.caption:
+                    content_rows.append([{"tag": "text", "text": item.caption}])
+                content_rows.append([{"tag": "img", "image_key": image_key}])
+                uploaded += 1
+            except Exception as e:
+                logger.warning(
+                    "[Feishu] album: failed to prepare %s: %s",
+                    item.path_or_url, e,
+                )
+                continue
+
+        if uploaded == 0 or not content_rows:
+            return SendResult(
+                success=False, error="No images could be uploaded for album"
+            )
+
+        # Build the post payload.  Bootstrap from _build_post_payload to
+        # preserve any adapter-level defaults (title, locale key), then
+        # replace the content with our interleaved rows.
+        try:
+            post = json.loads(self._build_post_payload(""))
+        except Exception:
+            post = {"zh_cn": {"title": "", "content": []}}
+        post.setdefault("zh_cn", {})["content"] = content_rows
+
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="post",
+                payload=json.dumps(post, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "album send failed")
+        except Exception as e:
+            logger.error(
+                "[Feishu] album: send failed, falling back to per-item: %s",
+                e, exc_info=True,
+            )
+            return await super().send_media_group(
+                chat_id, media_items, metadata=metadata,
+            )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Feishu bot API does not expose a typing indicator."""
