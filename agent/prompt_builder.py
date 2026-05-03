@@ -352,6 +352,31 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
 # message representation stays consistent ("system" everywhere).
 DEVELOPER_ROLE_MODELS = ("gpt-5", "codex")
 
+# Album/media-group sending protocol shared across all chat platforms that
+# support native media delivery.  Appended to each platform's MEDIA: paragraph
+# so every model (not just Claude) learns the per-item caption syntax.
+_MEDIA_GROUP_RULES = (
+    "\n\nAlbum delivery (multiple media in one message): "
+    "When sending 2 or more media files together, ALWAYS use this exact format — "
+    "consecutive MEDIA: lines form an album, with each caption on the line(s) "
+    "directly after its MEDIA: line:\n"
+    "\n"
+    "MEDIA:/tmp/cat.png\n"
+    "A fluffy cat\n"
+    "MEDIA:/tmp/dog.png\n"
+    "A happy dog\n"
+    "\n"
+    "Rules:\n"
+    "- NO blank lines between album items (a blank line ends the album)\n"
+    "- NO prose or commentary between MEDIA: lines (e.g. no 'Next is...')\n"
+    "- For local files, always use MEDIA:/path — never ![alt](path)\n"
+    "- To share ONE caption across the whole album, put it AFTER all MEDIA: lines instead\n"
+    "- Captions support MarkdownV2 (**bold**, _italic_, `code`, ||spoiler||)\n"
+    "\n"
+    "For complex multi-image delivery workflows, consult the "
+    "send-media-group skill via skill_view."
+)
+
 PLATFORM_HINTS = {
     "whatsapp": (
         "You are on a text messaging communication platform, WhatsApp. "
@@ -362,7 +387,7 @@ PLATFORM_HINTS = {
         ".webp) appear as photos, videos (.mp4, .mov) play inline, and other "
         "files arrive as downloadable documents. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as photos."
-    ),
+    ) + _MEDIA_GROUP_RULES,
     "telegram": (
         "You are on a text messaging communication platform, Telegram. "
         "Standard markdown is automatically converted to Telegram format. "
@@ -377,21 +402,21 @@ PLATFORM_HINTS = {
         "(.png, .jpg, .webp) appear as photos, audio (.ogg) sends as voice "
         "bubbles, and videos (.mp4) play inline. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as native photos."
-    ),
+    ) + _MEDIA_GROUP_RULES,
     "discord": (
         "You are in a Discord server or group chat communicating with your user. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are sent as photo "
         "attachments, audio as file attachments. You can also include image URLs "
         "in markdown format ![alt](url) and they will be sent as attachments."
-    ),
+    ) + _MEDIA_GROUP_RULES,
     "slack": (
         "You are in a Slack workspace communicating with your user. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are uploaded as photo "
         "attachments, audio as file attachments. You can also include image URLs "
         "in markdown format ![alt](url) and they will be uploaded as attachments."
-    ),
+    ) + _MEDIA_GROUP_RULES,
     "signal": (
         "You are on a text messaging communication platform, Signal. "
         "Please do not use markdown as it does not render. "
@@ -400,7 +425,7 @@ PLATFORM_HINTS = {
         "(.png, .jpg, .webp) appear as photos, audio as attachments, and other "
         "files arrive as downloadable documents. You can also include image "
         "URLs in markdown format ![alt](url) and they will be sent as photos."
-    ),
+    ) + _MEDIA_GROUP_RULES,
     "email": (
         "You are communicating via email. Write clear, well-structured responses "
         "suitable for email. Use plain text formatting (no markdown). "
@@ -437,7 +462,7 @@ PLATFORM_HINTS = {
         "appear as text messages. You can send media files natively: include "
         "MEDIA:/absolute/path/to/file in your response. Images (.jpg, .png, "
         ".heic) appear as photos and other files arrive as attachments."
-    ),
+    ) + _MEDIA_GROUP_RULES,
     "mattermost": (
         "You are in a Mattermost workspace communicating with your user. "
         "Mattermost renders standard Markdown — headings, bold, italic, code "
